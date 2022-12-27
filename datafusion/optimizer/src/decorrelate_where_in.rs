@@ -21,10 +21,13 @@ use crate::utils::{
     only_or_err, split_conjunction, swap_table, verify_not_disjunction,
 };
 use crate::{OptimizerConfig, OptimizerRule};
-use datafusion_common::{context, Result};
+use datafusion_common::{context, Column, Result};
+use datafusion_expr::expr_rewriter::replace_col;
 use datafusion_expr::logical_plan::{JoinType, Projection, Subquery};
+use datafusion_expr::utils::check_all_column_from_schema;
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
 use log::debug;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -125,58 +128,130 @@ fn optimize_where_in(
     let mut subqry_input = proj.input.clone();
     let proj = only_or_err(proj.expr.as_slice())
         .map_err(|e| context!("single expression projection required", e))?;
-    let subquery_col = proj
-        .try_into_col()
-        .map_err(|e| context!("single column projection required", e))?;
-    let outer_col = query_info
-        .where_in_expr
-        .try_into_col()
-        .map_err(|e| context!("column comparison required", e))?;
+    // let subquery_col = proj
+    //     .try_into_col()
+    //     .map_err(|e| context!("single column projection required", e))?;
+    // let outer_col = query_info
+    //     .where_in_expr
+    //     .try_into_col()
+    //     .map_err(|e| context!("column comparison required", e))?;
+    let subquery_expr = proj;
 
     // If subquery is correlated, grab necessary information
-    let mut subqry_cols = vec![];
-    let mut outer_cols = vec![];
-    let mut join_filters = None;
-    let mut other_subqry_exprs = vec![];
-    if let LogicalPlan::Filter(subqry_filter) = (*subqry_input).clone() {
+    let subqry_alias = format!("__sq_{}", config.next_id());
+    let (join_filter, subqry_plan) = if let LogicalPlan::Filter(subqry_filter) =
+        (*subqry_input).clone()
+    {
         // split into filters
         let subqry_filter_exprs = split_conjunction(&subqry_filter.predicate);
-        verify_not_disjunction(&subqry_filter_exprs)?;
 
-        // Grab column names to join on
-        let (col_exprs, other_exprs) =
-            find_join_exprs(subqry_filter_exprs, subqry_filter.input.schema())
-                .map_err(|e| context!("column correlation not found", e))?;
-        if !col_exprs.is_empty() {
-            // it's correlated
-            subqry_input = subqry_filter.input.clone();
-            (outer_cols, subqry_cols, join_filters) =
-                exprs_to_join_cols(&col_exprs, subqry_filter.input.schema(), false)
-                    .map_err(|e| context!("column correlation not found", e))?;
-            other_subqry_exprs = other_exprs;
+        let input_schema = subqry_filter.input.schema();
+        let (subquery_filters, join_filters): (Vec<Expr>, Vec<Expr>) =
+            subqry_filter_exprs
+                .iter()
+                .map(|expr| (*expr).clone())
+                .into_iter()
+                .partition(|expr| {
+                    let referenced_columns = expr.to_columns().unwrap();
+                    check_all_column_from_schema(
+                        &referenced_columns,
+                        input_schema.clone(),
+                    )
+                    .unwrap()
+                });
+        let join_filter = join_filters.into_iter().reduce(Expr::and);
+        let inner_and_outer_cols =
+            join_filter.as_ref().map_or(Result::Ok(vec![]), |filter| {
+                let mut referenced_cols = filter
+                    .to_columns()?
+                    .into_iter()
+                    .filter_map(|col| {
+                        // input_schema.field_from_column(col).is_ok()
+                        if input_schema.field_from_column(&col).is_ok() {
+                            let outer_col = Column::from_qualified_name(format!(
+                                "{}.{}",
+                                subqry_alias, col.name
+                            ));
+                            Some((col, outer_col))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<(_, _)>>();
+
+                referenced_cols.dedup();
+                Ok(referenced_cols)
+            })?;
+
+        let join_cols_replace_map: HashMap<&Column, &Column> = inner_and_outer_cols
+            .iter()
+            .map(|cols| (&cols.0, &cols.1))
+            .collect();
+        let alias_join_filter = join_filter.map_or(Ok(None), |filter| {
+            replace_col(filter, &join_cols_replace_map).map(Option::Some)
+        })?;
+
+        let (subquery_cols, _): (Vec<Column>, Vec<Column>) =
+            inner_and_outer_cols.into_iter().unzip();
+        let mut subqry_plan = LogicalPlanBuilder::from((*subqry_filter.input).clone());
+        if let Some(expr) = conjunction(subquery_filters) {
+            // if the subquery had additional expressions, restore them
+            subqry_plan = subqry_plan.filter(expr)?
         }
-    }
+        let projection = alias_cols(&subquery_cols);
+        let subqry_plan = subqry_plan
+            .project(projection)?
+            .alias(&subqry_alias)?
+            .build()?;
 
-    let (subqry_cols, outer_cols) =
-        merge_cols((&[subquery_col], &subqry_cols), (&[outer_col], &outer_cols));
+        (alias_join_filter, subqry_plan)
+    } else {
+        let input_schema = subqry_input.schema();
+        let join_filter = Some(Expr::eq(
+            query_info.where_in_expr.clone(),
+            subquery_expr.clone(),
+        ));
+        let inner_and_outer_cols =
+            join_filter.as_ref().map_or(Result::Ok(vec![]), |filter| {
+                let mut referenced_cols = filter
+                    .to_columns()?
+                    .into_iter()
+                    .filter_map(|col| {
+                        // input_schema.field_from_column(col).is_ok()
+                        if input_schema.field_from_column(&col).is_ok() {
+                            let outer_col = Column::from_qualified_name(format!(
+                                "{}.{}",
+                                subqry_alias, col.name
+                            ));
+                            Some((col, outer_col))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<(_, _)>>();
 
-    // build subquery side of join - the thing the subquery was querying
-    let subqry_alias = format!("__sq_{}", config.next_id());
-    let mut subqry_plan = LogicalPlanBuilder::from((*subqry_input).clone());
-    if let Some(expr) = conjunction(other_subqry_exprs) {
-        // if the subquery had additional expressions, restore them
-        subqry_plan = subqry_plan.filter(expr)?
-    }
-    let projection = alias_cols(&subqry_cols);
-    let subqry_plan = subqry_plan
-        .project(projection)?
-        .alias(&subqry_alias)?
-        .build()?;
-    debug!("subquery plan:\n{}", subqry_plan.display_indent());
+                referenced_cols.dedup();
+                Ok(referenced_cols)
+            })?;
 
-    // qualify the join columns for outside the subquery
-    let subqry_cols = swap_table(&subqry_alias, &subqry_cols);
-    let join_keys = (outer_cols, subqry_cols);
+        let join_cols_replace_map: HashMap<&Column, &Column> = inner_and_outer_cols
+            .iter()
+            .map(|cols| (&cols.0, &cols.1))
+            .collect();
+        let alias_join_filter = join_filter.map_or(Ok(None), |filter| {
+            replace_col(filter, &join_cols_replace_map).map(Option::Some)
+        })?;
+        let subqry_plan = LogicalPlanBuilder::from((*subqry_input).clone());
+        let (subquery_cols, _): (Vec<Column>, Vec<Column>) =
+            inner_and_outer_cols.into_iter().unzip();
+        let projection = alias_cols(&subquery_cols);
+        let subqry_plan = subqry_plan
+            .project(projection)?
+            .alias(&subqry_alias)?
+            .build()?;
+
+        (alias_join_filter, subqry_plan)
+    };
 
     // join our sub query into the main plan
     let join_type = match query_info.negated {
@@ -186,8 +261,8 @@ fn optimize_where_in(
     let mut new_plan = LogicalPlanBuilder::from(outer_input.clone()).join(
         subqry_plan,
         join_type,
-        join_keys,
-        join_filters,
+        (Vec::<Column>::new(), Vec::<Column>::new()),
+        join_filter,
     )?;
     if let Some(expr) = conjunction(outer_other_exprs.to_vec()) {
         new_plan = new_plan.filter(expr)? // if the main query had additional expressions, restore them
